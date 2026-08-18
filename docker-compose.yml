@@ -1,0 +1,21 @@
+services:
+  asr-proxy:
+    image: python:3.12-slim
+    container_name: asr-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - RUNPOD_POD_ID=x0bqjqp59e0ekl
+      - RUNPOD_API_KEY=BITTE_EINSETZEN
+      - IDLE_MINUTES=10
+      - TUNNEL_PORT=19000
+      - REMOTE_PORT=9000
+      - PIP_ROOT_USER_ACTION=ignore
+    volumes:
+      - /volume1/docker/asr-tunnel/keys:/keys:ro
+      - /volume1/docker/asr-proxy:/app:ro
+    command: >
+      sh -c "apt-get update -qq &&
+             apt-get install -y -qq --no-install-recommends openssh-client &&
+             pip install -q --no-cache-dir fastapi uvicorn httpx &&
+             uvicorn proxy:app --app-dir /app --host 172.17.0.1 --port 15900"
