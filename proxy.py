@@ -45,6 +45,11 @@ def _headers():
     return {"Authorization": f"Bearer {API_KEY}"}
 
 
+def _negiert(text: str):
+    """Sortierschluessel, der Zeichenketten absteigend sortiert."""
+    return tuple(-ord(c) for c in text)
+
+
 _pod_id_cache: str | None = None
 
 
@@ -98,8 +103,9 @@ async def pod_id_aufloesen(client: httpx.AsyncClient, erzwingen: bool = False) -
 
     treffer = [p for p in pods if passt(p)]
     # Laufende bevorzugen, danach die zuletzt gestarteten
+    # Laufende zuerst, danach der zuletzt gestartete
     treffer.sort(key=lambda p: (p.get("desiredStatus") != "RUNNING",
-                                p.get("lastStartedAt") or ""), reverse=False)
+                                _negiert(p.get("lastStartedAt") or "")))
     if not treffer:
         raise RuntimeError(f"Kein Pod gefunden fuer Referenz '{ref}' oder Volume '{VOLUME_ID}'")
 
