@@ -5,6 +5,16 @@
 export PATH=/workspace/bin:$PATH
 command -v ffmpeg >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq ffmpeg)
 
+# Eine SSH-Sitzung erbt die Container-Umgebung nicht. Die vom Pod gesetzten
+# Variablen (u.a. HF_TOKEN) stehen aber in der Umgebung von PID 1.
+if [ -r /proc/1/environ ]; then
+  while IFS= read -r -d '' eintrag; do
+    case "$eintrag" in
+      HF_TOKEN=*|HF_HOME=*|ASR_*=*|MODEL_IDLE_TIMEOUT=*) export "$eintrag" ;;
+    esac
+  done < /proc/1/environ
+fi
+
 . /workspace/venv/bin/activate
 cd /workspace/whisper-asr-webservice
 
