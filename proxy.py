@@ -193,14 +193,28 @@ async def _startup() -> None:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {
+    out = {
         "ok": True,
         "pod": POD_ID or None,
-        "api_key_gesetzt": bool(API_KEY),
         "tunnel": _tunnel_alive(),
         "inflight": _inflight,
         "sekunden_seit_letzter_nutzung": round(time.time() - _last_used),
     }
+    if not POD_ID or not API_KEY:
+        out["ok"] = False
+        out["fehler"] = "RUNPOD_POD_ID oder RUNPOD_API_KEY nicht gesetzt"
+        return out
+    try:
+        async with httpx.AsyncClient() as client:
+            info = await pod_info(client)
+        out["api"] = "erreichbar"
+        out["pod_status"] = info.get("desiredStatus")
+        out["gpu"] = (info.get("gpu") or {}).get("id")
+    except Exception as exc:
+        out["ok"] = False
+        out["api"] = "Fehler"
+        out["fehler"] = str(exc)[:200]
+    return out
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
