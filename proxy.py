@@ -98,6 +98,8 @@ def _open_tunnel(ip: str, port: int) -> None:
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
         "-o", "ExitOnForwardFailure=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         "-i", SSH_KEY,
         "-p", str(port),
         "-L", f"127.0.0.1:{TUNNEL_PORT}:localhost:{REMOTE_PORT}",
@@ -107,17 +109,29 @@ def _open_tunnel(ip: str, port: int) -> None:
     _tunnel = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _ssh_run(ip: str, port: int, command: str) -> int:
+def _ssh_run(ip: str, port: int, command: str, timeout: float = 60.0) -> int:
+    """Fuehrt einen Befehl per SSH aus. BatchMode verhindert, dass ssh auf eine
+    Passworteingabe wartet, wenn die Schluesselanmeldung scheitert."""
     cmd = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         "-i", SSH_KEY,
         "-p", str(port),
         f"root@{ip}",
         command,
     ]
-    return subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if r.returncode != 0:
+            log.warning("SSH-Befehl fehlgeschlagen (rc=%s): %s",
+                        r.returncode, r.stderr.decode(errors="replace")[:200].strip())
+        return r.returncode
+    except subprocess.TimeoutExpired:
+        log.warning("SSH-Befehl lief in einen Timeout nach %ss", timeout)
+        return 255
 
 
 async def _service_up(client: httpx.AsyncClient) -> bool:
