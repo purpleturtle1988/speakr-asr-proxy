@@ -17,6 +17,10 @@ from fastapi import FastAPI, Request, Response
 
 API = "https://rest.runpod.io/v1"
 POD_ID = os.environ.get("RUNPOD_POD_ID", "")
+# Datei hat Vorrang vor der Umgebungsvariable, damit sich der Pod wechseln laesst,
+# ohne den Stack (und damit den API-Key) anzufassen.
+POD_REF_DATEI = os.environ.get("POD_REF_DATEI", "/app/pod.txt")
+VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID", "")
 API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 IDLE_SECONDS = float(os.environ.get("IDLE_MINUTES", "10")) * 60
 SSH_KEY = os.environ.get("SSH_KEY", "/keys/id_ed25519")
@@ -41,8 +45,75 @@ def _headers():
     return {"Authorization": f"Bearer {API_KEY}"}
 
 
+_pod_id_cache: str | None = None
+
+
+def _pod_referenz() -> str:
+    """Liest die Pod-Referenz, Datei vor Umgebungsvariable."""
+    try:
+        with open(POD_REF_DATEI) as f:
+            wert = f.read().strip()
+            if wert:
+                return wert
+    except OSError:
+        pass
+    return POD_ID
+
+
+async def pod_id_aufloesen(client: httpx.AsyncClient, erzwingen: bool = False) -> str:
+    """Ermittelt die aktuelle Pod-ID.
+
+    RunPod vergibt bei einer Pod-Migration eine neue ID, die alte wird ungueltig.
+    Deshalb wird die Referenz (ID, Name oder Volume-ID) gegen die Pod-Liste
+    aufgeloest und das Ergebnis gemerkt.
+    """
+    global _pod_id_cache
+    if _pod_id_cache and not erzwingen:
+        return _pod_id_cache
+
+    ref = _pod_referenz()
+    if not ref and not VOLUME_ID:
+        raise RuntimeError("Weder Pod-Referenz noch Volume-ID konfiguriert")
+
+    # 1. Direkter Treffer ueber die ID
+    if ref:
+        r = await client.get(f"{API}/pods/{ref}", headers=_headers(), timeout=30)
+        if r.status_code == 200:
+            _pod_id_cache = ref
+            return ref
+
+    # 2. Ueber die Pod-Liste nach Name oder Volume suchen
+    r = await client.get(f"{API}/pods", headers=_headers(),
+                         params={"includeNetworkVolume": "true"}, timeout=30)
+    r.raise_for_status()
+    pods = r.json()
+    if isinstance(pods, dict):
+        pods = pods.get("data") or pods.get("pods") or []
+
+    def passt(pod: dict) -> bool:
+        if ref and pod.get("name") == ref:
+            return True
+        vol = (pod.get("networkVolume") or {}).get("id")
+        return bool(VOLUME_ID) and vol == VOLUME_ID
+
+    treffer = [p for p in pods if passt(p)]
+    # Laufende bevorzugen, danach die zuletzt gestarteten
+    treffer.sort(key=lambda p: (p.get("desiredStatus") != "RUNNING",
+                                p.get("lastStartedAt") or ""), reverse=False)
+    if not treffer:
+        raise RuntimeError(f"Kein Pod gefunden fuer Referenz '{ref}' oder Volume '{VOLUME_ID}'")
+
+    neu = treffer[0]["id"]
+    if neu != _pod_id_cache:
+        log.info("Pod aufgeloest: %s (Name: %s, Status: %s)",
+                 neu, treffer[0].get("name"), treffer[0].get("desiredStatus"))
+    _pod_id_cache = neu
+    return neu
+
+
 async def pod_info(client: httpx.AsyncClient) -> dict:
-    r = await client.get(f"{API}/pods/{POD_ID}", headers=_headers(), timeout=30)
+    pid = await pod_id_aufloesen(client)
+    r = await client.get(f"{API}/pods/{pid}", headers=_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -53,7 +124,8 @@ async def pod_start(client: httpx.AsyncClient, versuche: int = 12, pause: float 
     deshalb wird mehrfach versucht."""
     letzter = ""
     for i in range(versuche):
-        r = await client.post(f"{API}/pods/{POD_ID}/start", headers=_headers(), timeout=60)
+        pid = await pod_id_aufloesen(client)
+        r = await client.post(f"{API}/pods/{pid}/start", headers=_headers(), timeout=60)
         if r.status_code < 400:
             return
         letzter = f"{r.status_code} {r.text[:200]}"
@@ -67,7 +139,8 @@ async def pod_start(client: httpx.AsyncClient, versuche: int = 12, pause: float 
 
 
 async def pod_stop(client: httpx.AsyncClient) -> None:
-    r = await client.post(f"{API}/pods/{POD_ID}/stop", headers=_headers(), timeout=60)
+    pid = await pod_id_aufloesen(client)
+    r = await client.post(f"{API}/pods/{pid}/stop", headers=_headers(), timeout=60)
     log.info("Pod gestoppt (HTTP %s)", r.status_code)
 
 
@@ -167,8 +240,8 @@ async def _service_up(client: httpx.AsyncClient) -> bool:
 
 
 async def ensure_ready() -> None:
-    if not POD_ID or not API_KEY:
-        raise RuntimeError("RUNPOD_POD_ID oder RUNPOD_API_KEY ist nicht gesetzt")
+    if not (_pod_referenz() or VOLUME_ID) or not API_KEY:
+        raise RuntimeError("Pod-Referenz oder RUNPOD_API_KEY ist nicht gesetzt")
 
     deadline = time.time() + BOOT_TIMEOUT
     async with httpx.AsyncClient() as client:
@@ -238,7 +311,7 @@ async def idle_watcher() -> None:
             continue
         if time.time() - _last_used < IDLE_SECONDS:
             continue
-        if not (POD_ID and API_KEY):
+        if not API_KEY:
             continue
         try:
             async with httpx.AsyncClient() as client:
@@ -253,8 +326,8 @@ async def idle_watcher() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    if not POD_ID or not API_KEY:
-        log.error("RUNPOD_POD_ID oder RUNPOD_API_KEY fehlt. Der Proxy laeuft, "
+    if not (_pod_referenz() or VOLUME_ID) or not API_KEY:
+        log.error("Pod-Referenz oder RUNPOD_API_KEY fehlt. Der Proxy laeuft, "
                   "kann den Pod aber nicht steuern.")
     asyncio.create_task(idle_watcher())
 
@@ -263,14 +336,14 @@ async def _startup() -> None:
 async def healthz() -> dict:
     out = {
         "ok": True,
-        "pod": POD_ID or None,
+        "pod": _pod_id_cache or _pod_referenz() or None,
         "tunnel": _tunnel_alive(),
         "inflight": _inflight,
         "sekunden_seit_letzter_nutzung": round(time.time() - _last_used),
     }
-    if not POD_ID or not API_KEY:
+    if not (_pod_referenz() or VOLUME_ID) or not API_KEY:
         out["ok"] = False
-        out["fehler"] = "RUNPOD_POD_ID oder RUNPOD_API_KEY nicht gesetzt"
+        out["fehler"] = "Pod-Referenz oder RUNPOD_API_KEY nicht gesetzt"
         return out
     try:
         async with httpx.AsyncClient() as client:
