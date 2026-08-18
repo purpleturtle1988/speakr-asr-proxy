@@ -442,10 +442,21 @@ async def healthz() -> dict:
         return out
     try:
         async with httpx.AsyncClient() as client:
-            info = await pod_info(client)
-        out["api"] = "erreichbar"
-        out["pod_status"] = info.get("desiredStatus")
-        out["gpu"] = (info.get("gpu") or {}).get("id")
+            try:
+                info = await pod_info(client)
+                out["api"] = "erreichbar"
+                out["pod_status"] = info.get("desiredStatus")
+                out["gpu"] = (info.get("gpu") or {}).get("id")
+            except Exception as exc:
+                if _pod_spec() and "Kein Pod gefunden" in str(exc):
+                    # Im Erstellen-Modus ist "kein Pod vorhanden" der Normalzustand
+                    # im Leerlauf und kein Fehler.
+                    await client.get(f"{API}/pods", headers=_headers(),
+                                     params={"includeNetworkVolume": "true"}, timeout=30)
+                    out["api"] = "erreichbar"
+                    out["pod_status"] = "kein Pod (Leerlauf)"
+                else:
+                    raise
     except Exception as exc:
         out["ok"] = False
         out["api"] = "Fehler"
