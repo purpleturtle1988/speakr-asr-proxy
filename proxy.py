@@ -91,9 +91,9 @@ async def pod_id_aufloesen(client: httpx.AsyncClient, erzwingen: bool = False) -
         pods = pods.get("data") or pods.get("pods") or []
 
     def passt(pod: dict) -> bool:
-        if ref and pod.get("name") == ref:
-            return True
         vol = (pod.get("networkVolume") or {}).get("id")
+        if ref and (pod.get("name") == ref or vol == ref):
+            return True
         return bool(VOLUME_ID) and vol == VOLUME_ID
 
     treffer = [p for p in pods if passt(p)]
