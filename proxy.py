@@ -8,6 +8,7 @@ durch und stoppt den Pod nach einer Leerlaufzeit wieder.
 import asyncio
 import logging
 import os
+import socket
 import subprocess
 import time
 
@@ -68,6 +69,29 @@ async def pod_start(client: httpx.AsyncClient, versuche: int = 12, pause: float 
 async def pod_stop(client: httpx.AsyncClient) -> None:
     r = await client.post(f"{API}/pods/{POD_ID}/stop", headers=_headers(), timeout=60)
     log.info("Pod gestoppt (HTTP %s)", r.status_code)
+
+
+def _tcp_offen(ip: str, port: int, timeout: float = 3.0) -> bool:
+    """Prueft, ob auf ip:port eine TCP-Verbindung angenommen wird."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ssh_port_finden(ip: str, gemeldet: int) -> int | None:
+    """RunPods REST-API liefert unter portMappings["22"] den UDP-Port, waehrend
+    SSH auf einem anderen TCP-Port lauscht (beobachtet: TCP = UDP - 1). Da das
+    nirgends dokumentiert ist, werden die Kandidaten durchprobiert und der
+    genommen, der tatsaechlich eine TCP-Verbindung annimmt."""
+    for kandidat in (gemeldet - 1, gemeldet, gemeldet + 1):
+        if kandidat > 0 and _tcp_offen(ip, kandidat):
+            if kandidat != gemeldet:
+                log.info("SSH-Port %s statt gemeldetem %s (API liefert den UDP-Port)",
+                         kandidat, gemeldet)
+            return kandidat
+    return None
 
 
 def _tunnel_alive() -> bool:
@@ -168,7 +192,20 @@ async def ensure_ready() -> None:
         log.info("Pod bereit: ip=%s ssh-port=%s portMappings=%s ports=%s",
                  ip, ssh_port, info.get("portMappings"), info.get("ports"))
 
-        # Tunnel aufbauen und auf SSH warten
+        # TCP-Port fuer SSH ermitteln und auf Erreichbarkeit warten
+        tcp_port = None
+        while time.time() < deadline:
+            tcp_port = _ssh_port_finden(ip, int(ssh_port))
+            if tcp_port is not None:
+                break
+            await asyncio.sleep(5)
+        if tcp_port is None:
+            raise RuntimeError(
+                f"Auf {ip} nimmt weder Port {int(ssh_port) - 1}, {ssh_port} noch "
+                f"{int(ssh_port) + 1} eine TCP-Verbindung an")
+        ssh_port = tcp_port
+
+        # Tunnel aufbauen und auf SSH-Anmeldung warten
         if not _tunnel_alive():
             while time.time() < deadline:
                 if _ssh_run(ip, int(ssh_port), "true") == 0:
