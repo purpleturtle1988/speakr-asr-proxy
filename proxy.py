@@ -46,10 +46,23 @@ async def pod_info(client: httpx.AsyncClient) -> dict:
     return r.json()
 
 
-async def pod_start(client: httpx.AsyncClient) -> None:
-    r = await client.post(f"{API}/pods/{POD_ID}/start", headers=_headers(), timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Pod-Start fehlgeschlagen: {r.status_code} {r.text[:300]}")
+async def pod_start(client: httpx.AsyncClient, versuche: int = 12, pause: float = 20.0) -> None:
+    """Startet den Pod. RunPod antwortet sporadisch mit 500, wenn auf der
+    Host-Maschine gerade keine GPU frei ist. Das ist meist voruebergehend,
+    deshalb wird mehrfach versucht."""
+    letzter = ""
+    for i in range(versuche):
+        r = await client.post(f"{API}/pods/{POD_ID}/start", headers=_headers(), timeout=60)
+        if r.status_code < 400:
+            return
+        letzter = f"{r.status_code} {r.text[:200]}"
+        log.warning("Pod-Start Versuch %d/%d fehlgeschlagen: %s", i + 1, versuche, letzter)
+        # Falls ein paralleler Versuch bereits Erfolg hatte
+        info = await pod_info(client)
+        if info.get("desiredStatus") == "RUNNING":
+            return
+        await asyncio.sleep(pause)
+    raise RuntimeError(f"Pod-Start nach {versuche} Versuchen fehlgeschlagen: {letzter}")
 
 
 async def pod_stop(client: httpx.AsyncClient) -> None:
@@ -222,8 +235,15 @@ async def healthz() -> dict:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def forward(path: str, request: Request) -> Response:
     global _last_used, _inflight
-    async with _lock:
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=BOOT_TIMEOUT + 120)
+    except asyncio.TimeoutError:
+        return Response(content=b"Proxy ist belegt: eine andere Anfrage haelt den Aufweck-Vorgang.",
+                        status_code=503)
+    try:
         await ensure_ready()
+    finally:
+        _lock.release()
 
     _inflight += 1
     _last_used = time.time()
