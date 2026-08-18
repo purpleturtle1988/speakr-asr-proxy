@@ -32,12 +32,37 @@ POD_SPEC_DATEI = os.environ.get("POD_SPEC_DATEI", "/app/pod_spec.json")
 # ueberschriebenen Datei landen. Format: KEY=VALUE, eine Zeile pro Eintrag.
 POD_ENV_DATEI = os.environ.get("POD_ENV_DATEI", "/app/pod_env")
 API_KEY = os.environ.get("RUNPOD_API_KEY", "")
-IDLE_SECONDS = float(os.environ.get("IDLE_MINUTES", "10")) * 60
+IDLE_SECONDS = float(_einstellung("IDLE_MINUTES", "10")) * 60
 SSH_KEY = os.environ.get("SSH_KEY", "/keys/id_ed25519")
 TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "19000"))
 REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "9000"))
 START_CMD = os.environ.get("START_CMD", "bash /workspace/start_asr.sh")
-BOOT_TIMEOUT = float(os.environ.get("BOOT_TIMEOUT", "600"))
+def _konfig_datei(pfad: str = "/app/proxy_env") -> dict:
+    werte: dict[str, str] = {}
+    try:
+        with open(pfad) as f:
+            for zeile in f:
+                zeile = zeile.strip()
+                if zeile and not zeile.startswith("#") and "=" in zeile:
+                    k, _, v = zeile.partition("=")
+                    werte[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return werte
+
+
+_KONFIG = _konfig_datei()
+
+
+def _einstellung(name: str, standard: str) -> str:
+    """Datei schlaegt Umgebungsvariable, damit sich Werte aendern lassen,
+    ohne den Stack (und damit den API-Key) anzufassen."""
+    return _KONFIG.get(name, os.environ.get(name, standard))
+
+
+# Wie lange auf einen benutzbaren Pod gewartet wird. RunPod braucht gelegentlich
+# deutlich mehr als zehn Minuten, bis IP und Portmapping stehen.
+BOOT_TIMEOUT = float(_einstellung("BOOT_TIMEOUT", "1500"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("asr-proxy")
@@ -392,6 +417,23 @@ async def ensure_ready() -> None:
         log.info("ASR-Dienst ist bereit")
 
 
+async def _aufraeumen_nach_fehlschlag() -> None:
+    if not _pod_spec():
+        return
+    pid = _pod_id_cache
+    if not pid:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            log.warning("Aufwecken fehlgeschlagen, terminiere Pod %s", pid)
+            await pod_terminieren(client, pid)
+    except Exception as exc:
+        log.warning("Aufraeumen fehlgeschlagen: %s", exc)
+    finally:
+        globals()["_pod_id_cache"] = None
+        _kill_tunnel()
+
+
 async def idle_watcher() -> None:
     while True:
         await asyncio.sleep(60)
@@ -478,7 +520,13 @@ async def forward(path: str, request: Request) -> Response:
             return Response(content=b"Proxy ist belegt: eine andere Anfrage haelt den Aufweck-Vorgang.",
                             status_code=503)
         try:
-            await ensure_ready()
+            try:
+                await ensure_ready()
+            except Exception:
+                # Einen selbst erstellten, aber unbrauchbaren Pod wegraeumen,
+                # sonst laeuft er als Waise weiter und kostet Geld.
+                await _aufraeumen_nach_fehlschlag()
+                raise
         finally:
             _lock.release()
     except Exception:
