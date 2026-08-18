@@ -1,0 +1,26 @@
+{
+  "name": "speakr-asr",
+  "cloudType": "SECURE",
+  "computeType": "GPU",
+  "gpuCount": 1,
+  "gpuTypeIds": [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA L4",
+    "NVIDIA RTX A5000",
+    "NVIDIA RTX 4000 Ada Generation",
+    "NVIDIA RTX A4500",
+    "NVIDIA RTX 2000 Ada Generation"
+  ],
+  "gpuTypePriority": "availability",
+  "dataCenterIds": ["EU-RO-1"],
+  "dataCenterPriority": "custom",
+  "imageName": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
+  "containerDiskInGb": 30,
+  "volumeInGb": 0,
+  "networkVolumeId": "eg65mw6os5",
+  "volumeMountPath": "/workspace",
+  "ports": ["8888/http", "22/tcp"],
+  "env": {
+    "PUBLIC_KEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB5WchvJno4tJikI8wm85NsfOAaW8HjrYy+J1/sf0vsO speakr-asr-tunnel"
+  }
+}
