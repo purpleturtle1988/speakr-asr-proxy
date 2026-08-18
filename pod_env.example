@@ -1,0 +1,6 @@
+# Zusaetzliche Umgebungsvariablen fuer den erstellten Pod.
+# Diese Datei wird nie ueberschrieben und gehoert nicht ins Repo.
+# Auf dem NAS liegt sie unter /volume1/docker/asr-proxy/pod_env
+#
+# Fuer die Sprechererkennung (WhisperX + pyannote):
+# HF_TOKEN=hier_deinen_hugging_face_token_einsetzen

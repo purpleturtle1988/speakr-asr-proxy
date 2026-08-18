@@ -27,6 +27,10 @@ VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID", "")
 # Grund: Ein gestoppter Pod haengt an einer Host-Maschine und laesst sich oft
 # nicht mehr starten ("not enough free GPUs on the host machine").
 POD_SPEC_DATEI = os.environ.get("POD_SPEC_DATEI", "/app/pod_spec.json")
+# Zusaetzliche Umgebungsvariablen fuer den Pod, getrennt von der Spezifikation,
+# damit Geheimnisse (z.B. HF_TOKEN) nicht in einer versionierten oder
+# ueberschriebenen Datei landen. Format: KEY=VALUE, eine Zeile pro Eintrag.
+POD_ENV_DATEI = os.environ.get("POD_ENV_DATEI", "/app/pod_env")
 API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 IDLE_SECONDS = float(os.environ.get("IDLE_MINUTES", "10")) * 60
 SSH_KEY = os.environ.get("SSH_KEY", "/keys/id_ed25519")
@@ -156,13 +160,33 @@ async def pod_stop(client: httpx.AsyncClient) -> None:
     log.info("Pod gestoppt (HTTP %s)", r.status_code)
 
 
+def _pod_zusatz_env() -> dict:
+    """Liest zusaetzliche Pod-Variablen aus einer KEY=VALUE-Datei."""
+    werte: dict[str, str] = {}
+    try:
+        with open(POD_ENV_DATEI) as f:
+            for zeile in f:
+                zeile = zeile.strip()
+                if not zeile or zeile.startswith("#") or "=" not in zeile:
+                    continue
+                schluessel, _, wert = zeile.partition("=")
+                werte[schluessel.strip()] = wert.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return werte
+
+
 def _pod_spec() -> dict | None:
     """Liest die Pod-Spezifikation. Fehlt sie, bleibt es beim Start/Stop-Betrieb."""
     try:
         with open(POD_SPEC_DATEI) as f:
-            return json.load(f)
+            spec = json.load(f)
     except (OSError, ValueError):
         return None
+    zusatz = _pod_zusatz_env()
+    if zusatz:
+        spec.setdefault("env", {}).update(zusatz)
+    return spec
 
 
 async def pod_erstellen(client: httpx.AsyncClient, spec: dict) -> str:
@@ -407,6 +431,7 @@ async def healthz() -> dict:
         "ok": True,
         "pod": _pod_id_cache or _pod_referenz() or None,
         "modus": "erstellen/terminieren" if _pod_spec() else "start/stop",
+        "pod_zusatz_variablen": sorted(_pod_zusatz_env().keys()),
         "tunnel": _tunnel_alive(),
         "inflight": _inflight,
         "sekunden_seit_letzter_nutzung": round(time.time() - _last_used),
