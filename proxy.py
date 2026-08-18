@@ -165,6 +165,8 @@ async def ensure_ready() -> None:
             await asyncio.sleep(5)
         if not (ip and ssh_port):
             raise RuntimeError("Pod hat nach dem Start keine IP oder kein SSH-Portmapping geliefert")
+        log.info("Pod bereit: ip=%s ssh-port=%s portMappings=%s ports=%s",
+                 ip, ssh_port, info.get("portMappings"), info.get("ports"))
 
         # Tunnel aufbauen und auf SSH warten
         if not _tunnel_alive():
@@ -249,18 +251,25 @@ async def healthz() -> dict:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def forward(path: str, request: Request) -> Response:
     global _last_used, _inflight
-    try:
-        await asyncio.wait_for(_lock.acquire(), timeout=BOOT_TIMEOUT + 120)
-    except asyncio.TimeoutError:
-        return Response(content=b"Proxy ist belegt: eine andere Anfrage haelt den Aufweck-Vorgang.",
-                        status_code=503)
-    try:
-        await ensure_ready()
-    finally:
-        _lock.release()
-
+    # Sofort als belegt markieren, sonst stoppt der Leerlauf-Waechter den Pod
+    # mitten im Aufwecken.
     _inflight += 1
     _last_used = time.time()
+    try:
+        try:
+            await asyncio.wait_for(_lock.acquire(), timeout=BOOT_TIMEOUT + 120)
+        except asyncio.TimeoutError:
+            return Response(content=b"Proxy ist belegt: eine andere Anfrage haelt den Aufweck-Vorgang.",
+                            status_code=503)
+        try:
+            await ensure_ready()
+        finally:
+            _lock.release()
+    except Exception:
+        _inflight -= 1
+        _last_used = time.time()
+        raise
+
     try:
         body = await request.body()
         skip = {"host", "content-length", "connection"}
