@@ -27,7 +27,9 @@ BOOT_TIMEOUT = float(os.environ.get("BOOT_TIMEOUT", "600"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("asr-proxy")
 
-app = FastAPI()
+# Eigene Doku-Routen abschalten: sonst verdecken /docs, /redoc und
+# /openapi.json die gleichnamigen Pfade des ASR-Dienstes dahinter.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 _lock = asyncio.Lock()
 _tunnel: subprocess.Popen | None = None
 _last_used = time.time()
