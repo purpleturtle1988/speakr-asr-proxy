@@ -4,19 +4,21 @@ Aufwach-Proxy fuer den Speakr-ASR-Pod auf RunPod.
 Speakr spricht diesen Proxy an. Der Proxy startet bei Bedarf den Pod,
 baut den SSH-Tunnel auf, startet den ASR-Dienst, reicht die Anfrage
 durch und stoppt den Pod nach einer Leerlaufzeit wieder.
+
+Nutzt die RunPod REST-API v2 (api.runpod.io/v2). Die v1-API
+(rest.runpod.io/v1) wird am 15.11.2026 abgeschaltet (410 Gone).
 """
 import asyncio
 import json
 import logging
 import os
-import socket
 import subprocess
 import time
 
 import httpx
 from fastapi import FastAPI, Request, Response
 
-API = "https://rest.runpod.io/v1"
+API = "https://api.runpod.io/v2"
 POD_ID = os.environ.get("RUNPOD_POD_ID", "")
 # Datei hat Vorrang vor der Umgebungsvariable, damit sich der Pod wechseln laesst,
 # ohne den Stack (und damit den API-Key) anzufassen.
@@ -32,11 +34,12 @@ POD_SPEC_DATEI = os.environ.get("POD_SPEC_DATEI", "/app/pod_spec.json")
 # ueberschriebenen Datei landen. Format: KEY=VALUE, eine Zeile pro Eintrag.
 POD_ENV_DATEI = os.environ.get("POD_ENV_DATEI", "/app/pod_env")
 API_KEY = os.environ.get("RUNPOD_API_KEY", "")
-IDLE_SECONDS = float(_einstellung("IDLE_MINUTES", "10")) * 60
 SSH_KEY = os.environ.get("SSH_KEY", "/keys/id_ed25519")
 TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "19000"))
 REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "9000"))
 START_CMD = os.environ.get("START_CMD", "bash /workspace/start_asr.sh")
+
+
 def _konfig_datei(pfad: str = "/app/proxy_env") -> dict:
     werte: dict[str, str] = {}
     try:
@@ -60,8 +63,9 @@ def _einstellung(name: str, standard: str) -> str:
     return _KONFIG.get(name, os.environ.get(name, standard))
 
 
+IDLE_SECONDS = float(_einstellung("IDLE_MINUTES", "10")) * 60
 # Wie lange auf einen benutzbaren Pod gewartet wird. RunPod braucht gelegentlich
-# deutlich mehr als zehn Minuten, bis IP und Portmapping stehen.
+# deutlich mehr als zehn Minuten, bis der Pod RUNNING ist.
 BOOT_TIMEOUT = float(_einstellung("BOOT_TIMEOUT", "1500"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -100,6 +104,11 @@ def _pod_referenz() -> str:
     return POD_ID
 
 
+def _volume_id_von(pod: dict) -> str | None:
+    netz = (pod.get("mounts") or {}).get("network") or []
+    return netz[0].get("volumeId") if netz else None
+
+
 async def pod_id_aufloesen(client: httpx.AsyncClient, erzwingen: bool = False) -> str:
     """Ermittelt die aktuelle Pod-ID.
 
@@ -122,32 +131,28 @@ async def pod_id_aufloesen(client: httpx.AsyncClient, erzwingen: bool = False) -
             _pod_id_cache = ref
             return ref
 
-    # 2. Ueber die Pod-Liste nach Name oder Volume suchen
-    r = await client.get(f"{API}/pods", headers=_headers(),
-                         params={"includeNetworkVolume": "true"}, timeout=30)
+    # 2. Ueber die Pod-Liste nach Name oder Netzwerk-Volume suchen
+    r = await client.get(f"{API}/pods", headers=_headers(), timeout=30)
     r.raise_for_status()
-    pods = r.json()
-    if isinstance(pods, dict):
-        pods = pods.get("data") or pods.get("pods") or []
+    pods = r.json().get("pods", [])
 
     def passt(pod: dict) -> bool:
-        vol = (pod.get("networkVolume") or {}).get("id")
+        vol = _volume_id_von(pod)
         if ref and (pod.get("name") == ref or vol == ref):
             return True
         return bool(VOLUME_ID) and vol == VOLUME_ID
 
     treffer = [p for p in pods if passt(p)]
-    # Laufende bevorzugen, danach die zuletzt gestarteten
     # Laufende zuerst, danach der zuletzt gestartete
-    treffer.sort(key=lambda p: (p.get("desiredStatus") != "RUNNING",
-                                _negiert(p.get("lastStartedAt") or "")))
+    treffer.sort(key=lambda p: (p.get("status") != "RUNNING",
+                                _negiert(p.get("startedAt") or p.get("createdAt") or "")))
     if not treffer:
         raise RuntimeError(f"Kein Pod gefunden fuer Referenz '{ref}' oder Volume '{VOLUME_ID}'")
 
     neu = treffer[0]["id"]
     if neu != _pod_id_cache:
         log.info("Pod aufgeloest: %s (Name: %s, Status: %s)",
-                 neu, treffer[0].get("name"), treffer[0].get("desiredStatus"))
+                 neu, treffer[0].get("name"), treffer[0].get("status"))
     _pod_id_cache = neu
     return neu
 
@@ -159,30 +164,29 @@ async def pod_info(client: httpx.AsyncClient) -> dict:
     return r.json()
 
 
-async def pod_start(client: httpx.AsyncClient, versuche: int = 12, pause: float = 20.0) -> None:
-    """Startet den Pod. RunPod antwortet sporadisch mit 500, wenn auf der
-    Host-Maschine gerade keine GPU frei ist. Das ist meist voruebergehend,
-    deshalb wird mehrfach versucht."""
+async def pod_aktion(client: httpx.AsyncClient, aktion: str,
+                      versuche: int = 12, pause: float = 20.0) -> None:
+    """Loest eine Statusaenderung aus (start/stop/restart). RunPod antwortet
+    sporadisch mit einem Serverfehler, wenn auf der Host-Maschine gerade
+    keine GPU frei ist. Das ist meist voruebergehend, deshalb wird mehrfach
+    versucht."""
     letzter = ""
     for i in range(versuche):
         pid = await pod_id_aufloesen(client)
-        r = await client.post(f"{API}/pods/{pid}/start", headers=_headers(), timeout=60)
+        r = await client.post(f"{API}/pods/{pid}/action", headers=_headers(),
+                              json={"action": aktion}, timeout=60)
         if r.status_code < 400:
             return
         letzter = f"{r.status_code} {r.text[:200]}"
-        log.warning("Pod-Start Versuch %d/%d fehlgeschlagen: %s", i + 1, versuche, letzter)
-        # Falls ein paralleler Versuch bereits Erfolg hatte
-        info = await pod_info(client)
-        if info.get("desiredStatus") == "RUNNING":
-            return
+        log.warning("Pod-Aktion '%s' Versuch %d/%d fehlgeschlagen: %s",
+                    aktion, i + 1, versuche, letzter)
+        if aktion == "start":
+            # Falls ein paralleler Versuch bereits Erfolg hatte
+            info = await pod_info(client)
+            if info.get("status") == "RUNNING":
+                return
         await asyncio.sleep(pause)
-    raise RuntimeError(f"Pod-Start nach {versuche} Versuchen fehlgeschlagen: {letzter}")
-
-
-async def pod_stop(client: httpx.AsyncClient) -> None:
-    pid = await pod_id_aufloesen(client)
-    r = await client.post(f"{API}/pods/{pid}/stop", headers=_headers(), timeout=60)
-    log.info("Pod gestoppt (HTTP %s)", r.status_code)
+    raise RuntimeError(f"Pod-Aktion '{aktion}' nach {versuche} Versuchen fehlgeschlagen: {letzter}")
 
 
 def _pod_zusatz_env() -> dict:
@@ -215,42 +219,56 @@ def _pod_spec() -> dict | None:
 
 
 async def pod_erstellen(client: httpx.AsyncClient, spec: dict) -> str:
-    r = await client.post(f"{API}/pods", headers=_headers(), json=spec, timeout=120)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Pod-Erstellung fehlgeschlagen: {r.status_code} {r.text[:300]}")
-    daten = r.json()
-    pid = daten.get("id")
-    gpu = (daten.get("gpu") or {}).get("id") or daten.get("machineId")
-    log.info("Neuer Pod erstellt: %s (GPU: %s, %s/hr)", pid, gpu, daten.get("costPerHr"))
-    return pid
+    """Erstellt einen neuen Pod. Die v2-API platziert pro Aufruf genau EINEN
+    GPU-Typ und sucht anders als v1 nicht selbststaendig ueber mehrere
+    Kandidaten. Deshalb wird 'gpuTypeIds' (unsere eigene, nicht von der API
+    verstandene Erweiterung der Spezifikation) hier selbst der Reihe nach
+    durchprobiert. Fehlerbehandlung gemaess RunPod-Doku:
+    422 = Anfrage fehlerhaft (nie wiederholen), 402 = Guthaben leer (abbrechen),
+    400/403 = dieser Kandidat scheidet aus (naechster), 429 = Rate-Limit
+    (warten, gleicher Kandidat), 5xx = voruebergehend (kurz warten, gleicher
+    Kandidat)."""
+    spec = dict(spec)
+    kandidaten = spec.pop("gpuTypeIds", None)
+    if not kandidaten:
+        raise RuntimeError("Keine GPU-Kandidaten in der Pod-Spezifikation (gpuTypeIds fehlt)")
+    anzahl = spec.pop("gpuCount", 1)
+
+    letzter = ""
+    for gpu_id in kandidaten:
+        body = {**spec, "gpu": {"id": gpu_id, "count": anzahl}}
+        for _ in range(3):
+            r = await client.post(f"{API}/pods", headers=_headers(), json=body, timeout=120)
+            if r.status_code == 201:
+                daten = r.json()
+                pid = daten["id"]
+                log.info("Neuer Pod erstellt: %s (GPU: %s, %s $/h)",
+                         pid, gpu_id, daten.get("cost"))
+                return pid
+            letzter = f"{r.status_code} {r.text[:300]}"
+            if r.status_code == 422:
+                raise RuntimeError(f"Pod-Spezifikation ungueltig (422), Abbruch: {letzter}")
+            if r.status_code == 402:
+                raise RuntimeError(f"Guthaben nicht ausreichend (402), Abbruch: {letzter}")
+            if r.status_code == 429:
+                pause = float(r.headers.get("Retry-After", "5"))
+                log.warning("Rate-Limit bei GPU %s, warte %ss", gpu_id, pause)
+                await asyncio.sleep(pause)
+                continue
+            if r.status_code >= 500:
+                log.warning("GPU %s: Serverfehler %s, erneuter Versuch", gpu_id, letzter)
+                await asyncio.sleep(3)
+                continue
+            # 400 oder 403: keine Kapazitaet oder kein Zugriff, naechster Kandidat
+            log.info("GPU %s nicht verfuegbar (%s)", gpu_id, letzter)
+            break
+    raise RuntimeError(
+        f"Pod-Erstellung bei allen {len(kandidaten)} GPU-Kandidaten fehlgeschlagen: {letzter}")
 
 
 async def pod_terminieren(client: httpx.AsyncClient, pid: str) -> None:
     r = await client.delete(f"{API}/pods/{pid}", headers=_headers(), timeout=60)
     log.info("Pod %s terminiert (HTTP %s)", pid, r.status_code)
-
-
-def _tcp_offen(ip: str, port: int, timeout: float = 3.0) -> bool:
-    """Prueft, ob auf ip:port eine TCP-Verbindung angenommen wird."""
-    try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _ssh_port_finden(ip: str, gemeldet: int) -> int | None:
-    """RunPods REST-API liefert unter portMappings["22"] den UDP-Port, waehrend
-    SSH auf einem anderen TCP-Port lauscht (beobachtet: TCP = UDP - 1). Da das
-    nirgends dokumentiert ist, werden die Kandidaten durchprobiert und der
-    genommen, der tatsaechlich eine TCP-Verbindung annimmt."""
-    for kandidat in (gemeldet - 1, gemeldet, gemeldet + 1):
-        if kandidat > 0 and _tcp_offen(ip, kandidat):
-            if kandidat != gemeldet:
-                log.info("SSH-Port %s statt gemeldetem %s (API liefert den UDP-Port)",
-                         kandidat, gemeldet)
-            return kandidat
-    return None
 
 
 def _tunnel_alive() -> bool:
@@ -271,7 +289,7 @@ def _kill_tunnel() -> None:
         _tunnel = None
 
 
-def _open_tunnel(ip: str, port: int) -> None:
+def _open_tunnel(user: str, ip: str, port: int) -> None:
     global _tunnel
     _kill_tunnel()
     cmd = [
@@ -286,13 +304,13 @@ def _open_tunnel(ip: str, port: int) -> None:
         "-i", SSH_KEY,
         "-p", str(port),
         "-L", f"127.0.0.1:{TUNNEL_PORT}:localhost:{REMOTE_PORT}",
-        f"root@{ip}",
+        f"{user}@{ip}",
     ]
-    log.info("Oeffne SSH-Tunnel nach %s:%s", ip, port)
+    log.info("Oeffne SSH-Tunnel nach %s@%s:%s", user, ip, port)
     _tunnel = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _ssh_run(ip: str, port: int, command: str, timeout: float = 60.0) -> int:
+def _ssh_run(user: str, ip: str, port: int, command: str, timeout: float = 60.0) -> int:
     """Fuehrt einen Befehl per SSH aus. BatchMode verhindert, dass ssh auf eine
     Passworteingabe wartet, wenn die Schluesselanmeldung scheitert."""
     cmd = [
@@ -303,7 +321,7 @@ def _ssh_run(ip: str, port: int, command: str, timeout: float = 60.0) -> int:
         "-o", "ConnectTimeout=10",
         "-i", SSH_KEY,
         "-p", str(port),
-        f"root@{ip}",
+        f"{user}@{ip}",
         command,
     ]
     try:
@@ -325,99 +343,9 @@ async def _service_up(client: httpx.AsyncClient) -> bool:
         return False
 
 
-async def ensure_ready() -> None:
-    global _pod_id_cache
-    if not (_pod_referenz() or VOLUME_ID) or not API_KEY:
-        raise RuntimeError("Pod-Referenz oder RUNPOD_API_KEY ist nicht gesetzt")
-
-    deadline = time.time() + BOOT_TIMEOUT
-    async with httpx.AsyncClient() as client:
-        spec = _pod_spec()
-        info = None
-        try:
-            info = await pod_info(client)
-        except Exception as exc:
-            if not spec:
-                raise
-            log.info("Kein bestehender Pod gefunden (%s), erstelle einen neuen", exc)
-
-        if info is not None and info.get("desiredStatus") != "RUNNING":
-            if spec:
-                # Start versuchen; scheitert er (Host belegt), den Pod wegwerfen
-                # und einen neuen auf freier Hardware erstellen.
-                try:
-                    log.info("Pod steht (%s), versuche Start", info.get("desiredStatus"))
-                    await pod_start(client, versuche=2, pause=10.0)
-                except Exception as exc:
-                    log.warning("Start nicht moeglich (%s), erstelle stattdessen einen neuen Pod", exc)
-                    try:
-                        await pod_terminieren(client, info["id"])
-                    except Exception as e2:
-                        log.warning("Alten Pod konnte nicht terminiert werden: %s", e2)
-                    _pod_id_cache = await pod_erstellen(client, spec)
-                    info = None
-            else:
-                log.info("Pod steht (%s), starte ihn", info.get("desiredStatus"))
-                await pod_start(client)
-            _kill_tunnel()
-        elif info is None and spec:
-            _pod_id_cache = await pod_erstellen(client, spec)
-            _kill_tunnel()
-
-        # Auf IP und Portmapping warten
-        ip, ssh_port = None, None
-        while time.time() < deadline:
-            info = await pod_info(client)
-            ip = info.get("publicIp")
-            ssh_port = (info.get("portMappings") or {}).get("22")
-            if info.get("desiredStatus") == "RUNNING" and ip and ssh_port:
-                break
-            await asyncio.sleep(5)
-        if not (ip and ssh_port):
-            raise RuntimeError("Pod hat nach dem Start keine IP oder kein SSH-Portmapping geliefert")
-        log.info("Pod bereit: ip=%s ssh-port=%s portMappings=%s ports=%s",
-                 ip, ssh_port, info.get("portMappings"), info.get("ports"))
-
-        # TCP-Port fuer SSH ermitteln und auf Erreichbarkeit warten
-        tcp_port = None
-        while time.time() < deadline:
-            tcp_port = _ssh_port_finden(ip, int(ssh_port))
-            if tcp_port is not None:
-                break
-            await asyncio.sleep(5)
-        if tcp_port is None:
-            raise RuntimeError(
-                f"Auf {ip} nimmt weder Port {int(ssh_port) - 1}, {ssh_port} noch "
-                f"{int(ssh_port) + 1} eine TCP-Verbindung an")
-        ssh_port = tcp_port
-
-        # Tunnel aufbauen und auf SSH-Anmeldung warten
-        if not _tunnel_alive():
-            while time.time() < deadline:
-                if _ssh_run(ip, int(ssh_port), "true") == 0:
-                    break
-                await asyncio.sleep(5)
-            _open_tunnel(ip, int(ssh_port))
-            await asyncio.sleep(3)
-
-        # ASR-Dienst pruefen und noetigenfalls starten
-        if not await _service_up(client):
-            log.info("ASR-Dienst laeuft nicht, starte ihn auf dem Pod")
-            _ssh_run(ip, int(ssh_port), f"nohup {START_CMD} > /workspace/asr.log 2>&1 &")
-            while time.time() < deadline:
-                if not _tunnel_alive():
-                    _open_tunnel(ip, int(ssh_port))
-                    await asyncio.sleep(3)
-                if await _service_up(client):
-                    break
-                await asyncio.sleep(5)
-
-        if not await _service_up(client):
-            raise RuntimeError("ASR-Dienst wurde nicht rechtzeitig bereit")
-        log.info("ASR-Dienst ist bereit")
-
-
 async def _aufraeumen_nach_fehlschlag() -> None:
+    """Raeumt einen selbst erstellten, aber unbrauchbaren Pod weg, sonst
+    laeuft er als Waise weiter und kostet Geld."""
     if not _pod_spec():
         return
     pid = _pod_id_cache
@@ -434,6 +362,92 @@ async def _aufraeumen_nach_fehlschlag() -> None:
         _kill_tunnel()
 
 
+async def ensure_ready() -> None:
+    global _pod_id_cache
+    if not (_pod_referenz() or VOLUME_ID) or not API_KEY:
+        raise RuntimeError("Pod-Referenz oder RUNPOD_API_KEY ist nicht gesetzt")
+
+    deadline = time.time() + BOOT_TIMEOUT
+    async with httpx.AsyncClient() as client:
+        spec = _pod_spec()
+        info = None
+        try:
+            info = await pod_info(client)
+        except Exception as exc:
+            if not spec:
+                raise
+            log.info("Kein bestehender Pod gefunden (%s), erstelle einen neuen", exc)
+
+        if info is not None and info.get("status") != "RUNNING":
+            if spec:
+                # Start versuchen; scheitert er (Host belegt, Aktion nicht
+                # erlaubt), den Pod wegwerfen und einen neuen auf freier
+                # Hardware erstellen.
+                try:
+                    if "start" not in (info.get("actions") or []):
+                        raise RuntimeError(f"Aktion 'start' im Status {info.get('status')} nicht erlaubt")
+                    log.info("Pod steht (%s), versuche Start", info.get("status"))
+                    await pod_aktion(client, "start", versuche=2, pause=10.0)
+                except Exception as exc:
+                    log.warning("Start nicht moeglich (%s), erstelle stattdessen einen neuen Pod", exc)
+                    try:
+                        await pod_terminieren(client, info["id"])
+                    except Exception as e2:
+                        log.warning("Alten Pod konnte nicht terminiert werden: %s", e2)
+                    _pod_id_cache = await pod_erstellen(client, spec)
+                    info = None
+            else:
+                log.info("Pod steht (%s), starte ihn", info.get("status"))
+                await pod_aktion(client, "start")
+            _kill_tunnel()
+        elif info is None and spec:
+            _pod_id_cache = await pod_erstellen(client, spec)
+            _kill_tunnel()
+
+        # Auf RUNNING und die direkte SSH-Verbindung warten. Anders als v1
+        # liefert v2 Host und Port fertig aufgeloest unter ssh.direct, das
+        # fehleranfaellige Raten des TCP-Ports (v1 lieferte dort oft den
+        # UDP-Port) entfaellt damit.
+        ssh = None
+        while time.time() < deadline:
+            info = await pod_info(client)
+            ssh = (info.get("ssh") or {}).get("direct")
+            if info.get("status") == "RUNNING" and ssh:
+                break
+            await asyncio.sleep(5)
+        if not ssh:
+            raise RuntimeError("Pod hat nach dem Start keine direkte SSH-Verbindung (ssh.direct) geliefert")
+        ip = ssh["host"]
+        ssh_port = int(ssh["port"])
+        ssh_user = ssh.get("username") or "root"
+        log.info("Pod bereit: ssh=%s@%s:%s", ssh_user, ip, ssh_port)
+
+        # Auf SSH-Anmeldung warten und Tunnel aufbauen
+        if not _tunnel_alive():
+            while time.time() < deadline:
+                if _ssh_run(ssh_user, ip, ssh_port, "true") == 0:
+                    break
+                await asyncio.sleep(5)
+            _open_tunnel(ssh_user, ip, ssh_port)
+            await asyncio.sleep(3)
+
+        # ASR-Dienst pruefen und noetigenfalls starten
+        if not await _service_up(client):
+            log.info("ASR-Dienst laeuft nicht, starte ihn auf dem Pod")
+            _ssh_run(ssh_user, ip, ssh_port, f"nohup {START_CMD} > /workspace/asr.log 2>&1 &")
+            while time.time() < deadline:
+                if not _tunnel_alive():
+                    _open_tunnel(ssh_user, ip, ssh_port)
+                    await asyncio.sleep(3)
+                if await _service_up(client):
+                    break
+                await asyncio.sleep(5)
+
+        if not await _service_up(client):
+            raise RuntimeError("ASR-Dienst wurde nicht rechtzeitig bereit")
+        log.info("ASR-Dienst ist bereit")
+
+
 async def idle_watcher() -> None:
     while True:
         await asyncio.sleep(60)
@@ -446,7 +460,7 @@ async def idle_watcher() -> None:
         try:
             async with httpx.AsyncClient() as client:
                 info = await pod_info(client)
-                if info.get("desiredStatus") == "RUNNING":
+                if info.get("status") == "RUNNING":
                     _kill_tunnel()
                     if _pod_spec():
                         log.info("Leerlauf erreicht, terminiere Pod")
@@ -454,7 +468,7 @@ async def idle_watcher() -> None:
                         globals()["_pod_id_cache"] = None
                     else:
                         log.info("Leerlauf erreicht, stoppe Pod")
-                        await pod_stop(client)
+                        await pod_aktion(client, "stop", versuche=1)
         except Exception as exc:
             log.warning("Leerlauf-Pruefung fehlgeschlagen: %s", exc)
 
@@ -487,14 +501,13 @@ async def healthz() -> dict:
             try:
                 info = await pod_info(client)
                 out["api"] = "erreichbar"
-                out["pod_status"] = info.get("desiredStatus")
+                out["pod_status"] = info.get("status")
                 out["gpu"] = (info.get("gpu") or {}).get("id")
             except Exception as exc:
                 if _pod_spec() and "Kein Pod gefunden" in str(exc):
                     # Im Erstellen-Modus ist "kein Pod vorhanden" der Normalzustand
                     # im Leerlauf und kein Fehler.
-                    await client.get(f"{API}/pods", headers=_headers(),
-                                     params={"includeNetworkVolume": "true"}, timeout=30)
+                    await client.get(f"{API}/pods", headers=_headers(), timeout=30)
                     out["api"] = "erreichbar"
                     out["pod_status"] = "kein Pod (Leerlauf)"
                 else:
@@ -523,8 +536,6 @@ async def forward(path: str, request: Request) -> Response:
             try:
                 await ensure_ready()
             except Exception:
-                # Einen selbst erstellten, aber unbrauchbaren Pod wegraeumen,
-                # sonst laeuft er als Waise weiter und kostet Geld.
                 await _aufraeumen_nach_fehlschlag()
                 raise
         finally:
